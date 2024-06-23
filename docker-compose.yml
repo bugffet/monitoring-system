@@ -1,0 +1,135 @@
+version: "3"
+
+services:
+  php_fpm:
+    image: php:8.2.20-fpm
+    volumes:
+      - ./dockerfile/php_fpm/www.conf:/usr/local/etc/php-fpm.d/www.conf
+      - ./app/php:/var/www/html
+    environment:
+      - "PHP_FPM_PM_MAX_CHILDREN=10"
+      - "PHP_FPM_PM_START_SERVERS=5"
+      - "PHP_FPM_PM_MIN_SPARE_SERVERS=5"
+      - "PHP_FPM_PM_MAX_SPARE_SERVERS=5"
+      - "PHP_FPM_PM_MAX_REQUESTS=1000"
+  httpd:
+    depends_on:
+      - php_fpm
+      - fluentd
+    build:
+      context: ./dockerfile/httpd
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    volumes:
+      - ./dockerfile/httpd/httpd-vhosts.conf:/usr/local/apache2/conf/extra/httpd-vhosts.conf
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "localhost:24224"
+        fluentd-async: "true"
+        tag: httpd.access
+
+  # exporters
+  apache_exporter:
+    depends_on:
+      - httpd
+    image: lusotycoon/apache-exporter:latest
+    command:
+      - '--scrape_uri=http://httpd/server-status'
+    ports:
+      - "9117:9117"
+  php_fpm_exporter:
+    depends_on:
+      - php_fpm
+    image: hipages/php-fpm_exporter:latest
+    ports:
+      - "9253:9253"
+    environment:
+      PHP_FPM_SCRAPE_URI: "tcp://php_fpm:9000/status"
+      PHP_FPM_LOG_LEVEL: "debug"
+  blackbox_exporter:
+    image: prom/blackbox-exporter:latest
+    ports:
+    - 9115:9115
+      
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - "GF_SECURITY_ADMIN_PASSWORD=admin"
+      # - "GF_INSTALL_PLUGINS=grafana-synthetic-monitoring-app"
+    volumes:
+      - ./dockerfile/grafana/dashboard.yml:/etc/grafana/provisioning/dashboards/main.yaml
+      - ./dockerfile/grafana/datasource.yml:/etc/grafana/provisioning/datasources/main.yaml
+      - ./dockerfile/grafana/dashboards:/var/lib/grafana/dashboards
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./dockerfile/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  # EFK
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - esdata01:/usr/share/elasticsearch/data
+    ports:
+      - ${ES_PORT}:9200
+    environment:
+      - node.name=es01
+      - "discovery.type=single-node"
+      - xpack.security.enabled=false
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    mem_limit: ${MEM_LIMIT}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl --silent --fail localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+  
+  kibana:
+    depends_on:
+      es01:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    volumes:
+      - kibanadata:/usr/share/kibana/data
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=http://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+    mem_limit: ${MEM_LIMIT}
+
+  fluentd:
+    depends_on:
+      es01:
+        condition: service_healthy
+    build:
+      context: ./dockerfile/fluentd
+      dockerfile: Dockerfile
+    volumes:
+      - ./dockerfile/fluentd/fluent.conf:/fluentd/etc/fluent.conf
+    environment:
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+    ports:
+      - "24224:24224"
+      # curl -X POST -d 'json={"foo":"bar"}' http://localhost:9880/app.log
+      - "9880:9880"
+
+volumes:
+  certs:
+    driver: local
+  esdata01:
+    driver: local
+  kibanadata:
+    driver: local
